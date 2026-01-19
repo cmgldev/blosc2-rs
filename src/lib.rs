@@ -809,7 +809,25 @@ pub mod schunk {
     impl SChunk {
         pub fn new(storage: Storage) -> Self {
             let mut storage = storage;
+
+            // CRITICAL FIX: blosc2 C library divides by typesize internally
+            // Ensure typesize is set in BOTH the Rust struct AND what the C pointer sees
+            if storage.cparams.0.typesize == 0 {
+                storage.cparams.0.typesize = mem::size_of::<f32>() as i32;
+            }
+            // Update the pointer that blosc2_schunk_new will use
+            storage.inner.cparams = &mut storage.cparams.0 as *mut _;
+
             let schunk = unsafe { ffi::blosc2_schunk_new(&mut storage.inner) };
+
+            // Double-check: Also set typesize directly in the created schunk
+            // This handles case where blosc2 made a copy of cparams
+            unsafe {
+                if !schunk.is_null() && (*schunk).typesize == 0 {
+                    (*schunk).typesize = mem::size_of::<f32>() as i32;
+                }
+            }
+
             Self(Arc::new(RwLock::new(schunk)))
         }
 
@@ -848,11 +866,23 @@ pub mod schunk {
                 return Ok(self.inner().nchunks as usize);
             }
             let nbytes = mem::size_of::<T>() * data.len();
-            let typesize = self.typesize();
-            if nbytes % self.typesize() != 0 {
+            let typesize = if self.typesize() == 0 {
+                mem::size_of::<f32>()
+            } else {
+                self.typesize()
+            };
+            if nbytes % typesize != 0 {
                 let msg = format!("Buffer ({nbytes}) not evenly divisible by typesize: {typesize}");
                 return Err(Error::Other(msg));
             }
+
+            // Fix typesize=0 in the actual schunk before calling C library
+            unsafe {
+                if (**self.0.read()).typesize == 0 {
+                    (**self.0.write()).typesize = mem::size_of::<f32>() as i32;
+                }
+            }
+
             let nchunks = unsafe {
                 ffi::blosc2_schunk_append_buffer(*self.0.read(), data.as_ptr() as _, nbytes as _)
             };
@@ -1247,7 +1277,11 @@ impl CParams {
 impl Default for CParams {
     #[inline]
     fn default() -> Self {
-        let cparams = unsafe { ffi::blosc2_get_blosc2_cparams_defaults() };
+        let mut cparams = unsafe { ffi::blosc2_get_blosc2_cparams_defaults() };
+        // Set default typesize to f32 (4 bytes) to prevent divide-by-zero in blosc2 C library
+        if cparams.typesize == 0 {
+            cparams.typesize = mem::size_of::<f32>() as i32;
+        }
         Self(cparams)
     }
 }
